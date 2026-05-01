@@ -12,7 +12,7 @@ library(dplyr)
 #' @param AUCmin          Minimum acceptable AUC (training and validation).
 #' @param resultDir       Directory path for output files.
 #' @param spp             Species binomial (spaces OK; converted internally).
-#' @param occ_df          Data frame with columns decimalLongitude / decimalLatitude.
+#' @param occ_df          Data frame with columns LONG / LAT.
 #' @return  Named list: threshold (cloglog value used for PA map) and
 #'          quant_level (quantile level that produced that threshold).
 
@@ -42,7 +42,7 @@ save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
   build_pa_outputs <- function(r_best, maxent_args) {
 
     spp_pts  <- occ_df |>
-      dplyr::rename(x = decimalLongitude, y = decimalLatitude) |>
+      dplyr::rename(x = LONG, y = LAT) |>
       dplyr::select(x, y)
 
     # Sample background proportional to occurrence count (max 100 k)

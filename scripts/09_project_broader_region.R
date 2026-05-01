@@ -67,7 +67,7 @@ clip_projectionLayers <- function(layerDir, projectionExtent, varNames = NULL) {
 #'
 #' @param ENMeval_output  ENMevaluation object.
 #' @param training_vars   terra SpatRaster used to fit the model (accessible area).
-#' @param occ_df          Data frame with columns decimalLongitude / decimalLatitude
+#' @param occ_df          Data frame with columns LONG / LAT
 #'                        (thinned occurrences used in modelling).
 #' @param projection_vars terra SpatRaster for the full projection extent
 #'                        (must contain all layers present in training_vars).
@@ -128,7 +128,7 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
   # --- MESS surface ---
   # Reference values: environmental conditions at training occurrence localities.
   # Negative MESS = novel environment; positive = within training range.
-  occ_coords <- as.matrix(occ_df[, c("decimalLongitude", "decimalLatitude")])
+  occ_coords <- as.matrix(occ_df[, c("LONG", "LAT")])
   occ_env    <- terra::extract(training_vars, occ_coords, ID = FALSE) |> na.omit()
 
   mess_raster <- terra::mess(x = proj_subset, v = occ_env)
