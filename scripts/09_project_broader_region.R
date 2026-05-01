@@ -97,7 +97,7 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
   # --- Refit best model with maxnet (no temp files needed) ---
   # Background sampled from the accessible area (training extent + mask)
   occ_coords <- as.matrix(occ_df[, c("LONG", "LAT")])
-  occ_env    <- terra::extract(training_vars, occ_coords) |> dplyr::select(-ID) |> na.omit()
+  occ_env    <- terra::extract(training_vars, occ_coords) |> na.omit()
 
   bg_env <- terra::spatSample(training_vars, size = 10000,
                                method = "random", na.rm = TRUE,
@@ -147,8 +147,10 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
 
   # --- MESS surface ---
   # Negative MESS = novel environment outside the training occurrence range.
-  occ_env_mess <- terra::extract(training_vars, occ_coords) |> dplyr::select(-ID) |> na.omit()
-  mess_raster  <- terra::mess(x = proj_subset, v = occ_env_mess)
+  occ_env_mess <- terra::extract(training_vars, occ_coords) |> 
+  #  dplyr::select(-ID) |> 
+    na.omit()
+  mess_raster  <- dismo::mess(x = raster::stack(proj_subset), v = occ_env_mess)
   names(mess_raster) <- "MESS"
 
   terra::writeRaster(mess_raster,
