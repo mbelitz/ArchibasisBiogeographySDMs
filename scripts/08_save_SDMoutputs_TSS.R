@@ -54,12 +54,12 @@ save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
   # Helper: calculate modified TSS at a given quantile level p
   # TSS = (Se + 0.33*Sp) - 1  where Se = sensitivity, Sp = specificity
   calculate_tss <- function(p, r_best, spp_pts, back_pts) {
-    thresh  <- quantile(terra::extract(r_best, spp_pts, ID = FALSE)[[1]], probs = p, na.rm = TRUE)
+    thresh  <- quantile(terra::extract(r_best, spp_pts)[[2]], probs = p, na.rm = TRUE)
     pa_mat  <- matrix(c(0, thresh, 0, thresh, 1, 1), ncol = 3, byrow = TRUE)
     r_pa    <- terra::classify(r_best, pa_mat)
 
-    pres_vals <- terra::extract(r_pa, spp_pts, ID = FALSE) |> dplyr::rename(pa = 1) |> na.omit()
-    abs_vals  <- terra::extract(r_pa, back_pts, ID = FALSE) |> dplyr::rename(pa = 1) |> na.omit()
+    pres_vals <- terra::extract(r_pa, spp_pts) |> dplyr::select(-ID) |> dplyr::rename(pa = 1) |> na.omit()
+    abs_vals  <- terra::extract(r_pa, back_pts) |> dplyr::select(-ID) |> dplyr::rename(pa = 1) |> na.omit()
 
     Se  <- sum(pres_vals$pa)    / nrow(pres_vals)
     Sp  <- sum(1 - abs_vals$pa) / nrow(abs_vals)
@@ -87,7 +87,7 @@ save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
     best_q <- dplyr::filter(tss_df, tss == max(tss))$quant
     if (length(best_q) > 1) best_q <- stats::median(best_q)
 
-    occ_pred   <- terra::extract(r_best, spp_pts, ID = FALSE)[[1]]
+    occ_pred   <- terra::extract(r_best, spp_pts)[[2]]
     lpt_thresh <- quantile(occ_pred, probs = best_q, na.rm = TRUE)
 
     pa_mat <- matrix(c(0, lpt_thresh, 0, lpt_thresh, 1, 1), ncol = 3, byrow = TRUE)
