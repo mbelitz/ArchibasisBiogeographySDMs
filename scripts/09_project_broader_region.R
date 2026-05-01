@@ -109,7 +109,21 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
   best_model <- ENMeval_output@models[[model_idx[1]]]
 
   # --- Subset projection layers to the variables used in training ---
-  proj_subset <- projection_vars[[names(training_vars)]]
+  # Drive the subset from the model's own stored variable names (colnames of
+  # @presence) rather than names(training_vars): ENMeval passes data to
+  # maxent.jar via temp ASC files whose names can differ slightly from the
+  # SpatRaster layer names, and dismo::predict.MaxEnt checks @presence colnames.
+  model_var_names <- colnames(best_model@presence)
+  proj_subset     <- projection_vars[[model_var_names]]
+
+  missing_vars <- setdiff(model_var_names, names(proj_subset))
+  if (length(missing_vars) > 0) {
+    stop(sprintf(
+      "Projection raster missing variables required by model: %s\nAvailable layers: %s",
+      paste(missing_vars, collapse = ", "),
+      paste(names(projection_vars), collapse = ", ")
+    ))
+  }
 
   # --- Continuous cloglog projection (MaxEnt native clamping enabled by default) ---
   # dismo::predict.MaxEnt runs maxent.jar in project mode; clamping is on by
