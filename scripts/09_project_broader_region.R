@@ -98,7 +98,15 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
   }
 
   maxent_args <- as.character(bestmod$tune.args)
-  best_model  <- ENMeval_output@models[[maxent_args]]
+
+  # Use numeric-index lookup for the same robustness reason as in 08_save_SDMoutputs_TSS.R
+  model_names <- as.character(names(ENMeval_output@models))
+  model_idx   <- which(model_names == maxent_args)
+  if (length(model_idx) == 0) {
+    stop(sprintf("Model '%s' not found in @models.\nAvailable: %s",
+                 maxent_args, paste(model_names, collapse = ", ")))
+  }
+  best_model <- ENMeval_output@models[[model_idx[1]]]
 
   # --- Subset projection layers to the variables used in training ---
   proj_subset <- projection_vars[[names(training_vars)]]
