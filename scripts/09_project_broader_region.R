@@ -1,8 +1,7 @@
 library(terra)
 library(sf)
 library(dplyr)
-library(dismo)   # for predict.MaxEnt
-library(raster)  # bridge: dismo::predict requires RasterStack input
+library(maxnet)
 library(rnaturalearth)
 library(ggplot2)
 library(stringr)
@@ -33,10 +32,9 @@ define_projectionExtent <- function() {
 
 #' Clip global WorldClim (or equivalent) layers to the projection extent.
 #'
-#' @param layerDir        Directory of global .tif rasters (one per variable).
+#' @param layerDir          Directory of global .tif rasters (one per variable).
 #' @param projectionExtent  sf polygon returned by define_projectionExtent().
-#' @param varNames        Character vector of layer names to keep (subset of
-#'                        all rasters in layerDir). NULL keeps all layers.
+#' @param varNames          Character vector of layer names to keep. NULL keeps all.
 #' @return  terra SpatRaster masked to projectionExtent.
 
 clip_projectionLayers <- function(layerDir, projectionExtent, varNames = NULL) {
@@ -56,28 +54,21 @@ clip_projectionLayers <- function(layerDir, projectionExtent, varNames = NULL) {
 
 #' Project the best MaxEnt model to the AU+SEA region.
 #'
-#' MaxEnt's native clamping is applied by default during dismo::predict():
-#' predictor values outside the training range are clamped to [min, max]
-#' before prediction, preventing unconstrained extrapolation.
-#'
-#' A MESS (Multivariate Environmental Similarity Surface) raster is also
-#' saved alongside the prediction. Negative MESS values flag cells whose
-#' environment is outside the multivariate range of the training occurrences;
-#' use this as a companion layer when interpreting the projection.
+#' The best ENMeval parameter combination (fc + rm) is re-fitted using maxnet
+#' (pure R) so projection works regardless of whether the original maxent.jar
+#' temp files still exist. Clamping is applied via maxnet's clamp = TRUE
+#' argument, restricting predictor values to the training range before
+#' prediction. A MESS surface is saved alongside the continuous prediction.
 #'
 #' @param ENMeval_output  ENMevaluation object.
 #' @param training_vars   terra SpatRaster used to fit the model (accessible area).
-#' @param occ_df          Data frame with columns LONG / LAT
-#'                        (thinned occurrences used in modelling).
-#' @param projection_vars terra SpatRaster for the full projection extent
-#'                        (must contain all layers present in training_vars).
-#' @param tss_threshold   Numeric cloglog threshold value returned by
-#'                        save_SDM_results() — applied to produce the PA map.
+#' @param occ_df          Data frame with columns LONG / LAT.
+#' @param projection_vars terra SpatRaster for the full projection extent.
+#' @param tss_threshold   Numeric cloglog threshold from save_SDM_results().
 #' @param resultDir       Output directory.
 #' @param spp             Species binomial.
-#' @param mapDir          Optional directory for saving a PNG map. NULL skips.
-#' @return  Invisible named list: projection (SpatRaster), mess (SpatRaster),
-#'          proj_pa (SpatRaster).
+#' @param mapDir          Optional directory for PNG maps. NULL skips.
+#' @return  Invisible named list: projection, mess, proj_pa (all SpatRasters).
 
 project_toRegion <- function(ENMeval_output, training_vars, occ_df,
                               projection_vars, tss_threshold,
@@ -85,53 +76,60 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
 
   spp_bw <- stringr::str_replace(spp, " ", "_")
 
-  # --- Identify best model ---
-  bestmod     <- ENMeval_output@results |> dplyr::filter(delta.AICc == 0)
-  bestmod     <- bestmod[1, ]
+  # --- Identify best model parameters from ENMeval results ---
+  bestmod <- ENMeval_output@results |> dplyr::filter(delta.AICc == 0)
+  bestmod <- bestmod[1, ]
 
-  # Fall back to highest AUC if best AICc model has low AUC
-  if (!"auc.train" %in% names(bestmod) || is.na(bestmod$auc.train) ||
-      bestmod$auc.train < 0.7) {
+  if (is.na(bestmod$auc.train) || bestmod$auc.train < 0.7) {
     bestmod <- ENMeval_output@results |>
       dplyr::filter(auc.train == max(auc.train, na.rm = TRUE))
     bestmod <- bestmod[1, ]
   }
 
-  maxent_args <- as.character(bestmod$tune.args)
+  # Parse tune.args string (format: "rm.0.5_fc.LQ")
+  tune_str <- as.character(bestmod$tune.args)
+  rm_val   <- as.numeric(sub("rm\\.([^_]+)_fc\\..*", "\\1", tune_str))
+  fc_str   <- sub(".*_fc\\.(.+)",                    "\\1", tune_str)
+  fc_maxnet <- tolower(fc_str)   # maxnet uses lowercase: "l","q","h","p","t"
 
-  # Use numeric-index lookup for the same robustness reason as in 08_save_SDMoutputs_TSS.R
-  model_names <- as.character(names(ENMeval_output@models))
-  model_idx   <- which(model_names == maxent_args)
-  if (length(model_idx) == 0) {
-    stop(sprintf("Model '%s' not found in @models.\nAvailable: %s",
-                 maxent_args, paste(model_names, collapse = ", ")))
-  }
-  best_model <- ENMeval_output@models[[model_idx[1]]]
+  message(sprintf("[%s] Refitting best model: rm = %s, fc = %s", spp, rm_val, fc_str))
 
-  # --- Subset projection layers to the variables used in training ---
-  # Drive the subset from the model's own stored variable names (colnames of
-  # @presence) rather than names(training_vars): ENMeval passes data to
-  # maxent.jar via temp ASC files whose names can differ slightly from the
-  # SpatRaster layer names, and dismo::predict.MaxEnt checks @presence colnames.
-  model_var_names <- colnames(best_model@presence)
-  proj_subset     <- projection_vars[[model_var_names]]
+  # --- Refit best model with maxnet (no temp files needed) ---
+  # Background sampled from the accessible area (training extent + mask)
+  occ_coords <- as.matrix(occ_df[, c("LONG", "LAT")])
+  occ_env    <- terra::extract(training_vars, occ_coords, ID = FALSE) |> na.omit()
 
-  missing_vars <- setdiff(model_var_names, names(proj_subset))
+  bg_env <- terra::spatSample(training_vars, size = 10000,
+                               method = "random", na.rm = TRUE,
+                               values = TRUE, xy = FALSE) |>
+    as.data.frame()
+
+  p    <- c(rep(1L, nrow(occ_env)), rep(0L, nrow(bg_env)))
+  data <- rbind(occ_env, bg_env)
+
+  f          <- maxnet::maxnet.formula(p, data, classes = fc_maxnet)
+  maxnet_mod <- maxnet::maxnet(p, data, f, regmult = rm_val)
+
+  # --- Subset projection layers to training variables ---
+  proj_subset <- projection_vars[[names(training_vars)]]
+
+  missing_vars <- setdiff(names(training_vars), names(proj_subset))
   if (length(missing_vars) > 0) {
     stop(sprintf(
-      "Projection raster missing variables required by model: %s\nAvailable layers: %s",
+      "Projection raster missing variables: %s\nAvailable: %s",
       paste(missing_vars, collapse = ", "),
       paste(names(projection_vars), collapse = ", ")
     ))
   }
 
-  # --- Continuous cloglog projection (MaxEnt native clamping enabled by default) ---
-  # dismo::predict.MaxEnt runs maxent.jar in project mode; clamping is on by
-  # default (doclamp=true in the saved model settings).
-  # The raster::stack() call is a bridge required by dismo — it does not imply
-  # continued use of the raster package for any other operations.
-  proj_raster_raw <- dismo::predict(best_model, raster::stack(proj_subset))
-  proj_raster     <- terra::rast(proj_raster_raw)
+  # --- Continuous cloglog projection with clamping ---
+  # terra::predict passes each chunk as a data frame to predict.maxnet;
+  # clamp = TRUE restricts values to [training min, training max] per variable.
+  proj_raster <- terra::predict(proj_subset, maxnet_mod,
+                                 fun    = predict,
+                                 clamp  = TRUE,
+                                 type   = "cloglog",
+                                 na.rm  = TRUE)
   names(proj_raster) <- "cloglog"
 
   terra::writeRaster(proj_raster,
@@ -139,8 +137,8 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
                      overwrite = TRUE)
 
   # --- Presence-absence map using threshold from training area ---
-  pa_mat   <- matrix(c(0, tss_threshold, 0, tss_threshold, 1, 1), ncol = 3, byrow = TRUE)
-  proj_pa  <- terra::classify(proj_raster, pa_mat)
+  pa_mat  <- matrix(c(0, tss_threshold, 0, tss_threshold, 1, 1), ncol = 3, byrow = TRUE)
+  proj_pa <- terra::classify(proj_raster, pa_mat)
   names(proj_pa) <- "presence"
 
   terra::writeRaster(proj_pa,
@@ -148,12 +146,9 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
                      overwrite = TRUE)
 
   # --- MESS surface ---
-  # Reference values: environmental conditions at training occurrence localities.
-  # Negative MESS = novel environment; positive = within training range.
-  occ_coords <- as.matrix(occ_df[, c("LONG", "LAT")])
-  occ_env    <- terra::extract(training_vars, occ_coords, ID = FALSE) |> na.omit()
-
-  mess_raster <- terra::mess(x = proj_subset, v = occ_env)
+  # Negative MESS = novel environment outside the training occurrence range.
+  occ_env_mess <- terra::extract(training_vars, occ_coords, ID = FALSE) |> na.omit()
+  mess_raster  <- terra::mess(x = proj_subset, v = occ_env_mess)
   names(mess_raster) <- "MESS"
 
   terra::writeRaster(mess_raster,
@@ -164,7 +159,7 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
   message(sprintf("[%s] Projection complete. Novel-environment cells (MESS < 0): %.1f%%",
                   spp, pct_novel))
 
-  # --- Optional map ---
+  # --- Optional maps ---
   if (!is.null(mapDir)) {
     world <- ne_countries(scale = "medium", returnclass = "sf")
 
