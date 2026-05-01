@@ -16,6 +16,34 @@ library(dplyr)
 #' @return  Named list: threshold (cloglog value used for PA map) and
 #'          quant_level (quantile level that produced that threshold).
 
+# Extract a prediction layer from an ENMevaluation object by tune.args string.
+# Uses numeric-position fallback because name-based [[]] lookup on a SpatRaster
+# can silently return an empty raster when layer names contain dots or differ
+# slightly in numeric formatting (e.g. "rm.1" vs "rm.1.0").
+.extract_prediction <- function(enm_obj, tune_args_str) {
+  preds <- enm_obj@predictions
+  pred_names <- as.character(names(preds))
+
+  # Try name lookup first
+  r_raw <- tryCatch(preds[[tune_args_str]], error = function(e) NULL)
+
+  # Fall back to numeric index if name lookup returned empty or failed
+  if (is.null(r_raw) ||
+      (inherits(r_raw, "SpatRaster") && terra::ncell(r_raw) == 0)) {
+    idx <- which(pred_names == tune_args_str)
+    if (length(idx) == 0) {
+      stop(sprintf(
+        "Prediction for '%s' not found.\nAvailable models: %s",
+        tune_args_str, paste(pred_names, collapse = ", ")
+      ))
+    }
+    r_raw <- preds[[idx[1]]]
+  }
+
+  if (!inherits(r_raw, "SpatRaster")) r_raw <- terra::rast(r_raw)
+  r_raw
+}
+
 save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
 
   spp_bw <- stringr::str_replace(spp, " ", "_")
@@ -33,15 +61,15 @@ save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
     pres_vals <- terra::extract(r_pa, spp_pts, ID = FALSE) |> dplyr::rename(pa = 1) |> na.omit()
     abs_vals  <- terra::extract(r_pa, back_pts, ID = FALSE) |> dplyr::rename(pa = 1) |> na.omit()
 
-    Se  <- sum(pres_vals$pa)       / nrow(pres_vals)
-    Sp  <- sum(1 - abs_vals$pa)    / nrow(abs_vals)
+    Se  <- sum(pres_vals$pa)    / nrow(pres_vals)
+    Sp  <- sum(1 - abs_vals$pa) / nrow(abs_vals)
     (Se + 0.33 * Sp) - 1
   }
 
   # Shared PA-threshold logic used regardless of which model is selected
   build_pa_outputs <- function(r_best, maxent_args) {
 
-    spp_pts  <- occ_df |>
+    spp_pts <- occ_df |>
       dplyr::rename(x = LONG, y = LAT) |>
       dplyr::select(x, y)
 
@@ -55,16 +83,15 @@ save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
     tss_vals <- sapply(quant_levels, calculate_tss,
                        r_best = r_best, spp_pts = spp_pts, back_pts = back_pts)
 
-    tss_df    <- data.frame(tss = tss_vals, quant = quant_levels)
-    best_q    <- dplyr::filter(tss_df, tss == max(tss))$quant
+    tss_df <- data.frame(tss = tss_vals, quant = quant_levels)
+    best_q <- dplyr::filter(tss_df, tss == max(tss))$quant
     if (length(best_q) > 1) best_q <- stats::median(best_q)
 
-    # Apply the chosen threshold
-    occ_pred  <- terra::extract(r_best, spp_pts, ID = FALSE)[[1]]
+    occ_pred   <- terra::extract(r_best, spp_pts, ID = FALSE)[[1]]
     lpt_thresh <- quantile(occ_pred, probs = best_q, na.rm = TRUE)
 
-    pa_mat   <- matrix(c(0, lpt_thresh, 0, lpt_thresh, 1, 1), ncol = 3, byrow = TRUE)
-    r_pa     <- terra::classify(r_best, pa_mat)
+    pa_mat <- matrix(c(0, lpt_thresh, 0, lpt_thresh, 1, 1), ncol = 3, byrow = TRUE)
+    r_pa   <- terra::classify(r_best, pa_mat)
     terra::writeRaster(r_pa,
                        filename  = file.path(resultDir, paste0(spp_bw, "_SDM_PA.tif")),
                        overwrite = TRUE)
@@ -85,7 +112,7 @@ save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
               file      = file.path(resultDir, paste0(spp_bw, "_bestModel.csv")),
               row.names = FALSE)
 
-    r_best <- terra::rast(ENMeval_output@predictions[[maxent_args]])
+    r_best <- .extract_prediction(ENMeval_output, maxent_args)
     terra::writeRaster(r_best,
                        filename  = file.path(resultDir, paste0(spp_bw, "_SDM.tif")),
                        overwrite = TRUE)
@@ -105,7 +132,7 @@ save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
               file      = file.path(resultDir, paste0(spp_bw, "_bestModel.csv")),
               row.names = FALSE)
 
-    r_best <- terra::rast(ENMeval_output@predictions[[maxent_args]])
+    r_best <- .extract_prediction(ENMeval_output, maxent_args)
     terra::writeRaster(r_best,
                        filename  = file.path(resultDir, paste0(spp_bw, "_SDM.tif")),
                        overwrite = TRUE)
