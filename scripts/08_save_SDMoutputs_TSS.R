@@ -129,7 +129,17 @@ save_SDM_results <- function(ENMeval_output, AUCmin, resultDir, spp, occ_df) {
   # ── Inner helper: build PA raster and save all outputs ────────────────────
   build_pa_outputs <- function(r_best, maxent_args) {
 
-    spp_pts <- occ_df |> dplyr::rename(x = LONG, y = LAT) |> dplyr::select(x, y)
+    # Project occurrence coordinates to the raster's CRS if it is not longlat.
+    # This handles the case where the rasters have been reprojected to an
+    # equal-area CRS (e.g. AU+SEA Albers) before model fitting.
+    spp_coords <- as.matrix(occ_df[, c("LONG", "LAT")])
+    if (!terra::is.lonlat(r_best)) {
+      spp_coords <- terra::project(spp_coords,
+                                    from = "EPSG:4326",
+                                    to   = terra::crs(r_best, proj = TRUE))
+    }
+    spp_pts <- as.data.frame(spp_coords)
+    colnames(spp_pts) <- c("x", "y")
 
     # Background points sampled from the accessible-area raster (same extent as
     # the model was trained on). Size = min(nOcc × 1000, 100000) then subsampled

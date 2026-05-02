@@ -11,7 +11,8 @@
 # Step 0 — Load and filter occurrences from the combined database.
 # Step 1 — Define the accessible area (M region): the geographic area the
 #           species could plausibly have reached, used to sample background.
-# Step 2 — Clip environmental rasters to M and coarsen resolution.
+# Step 2 — Clip environmental rasters to M, coarsen resolution, and reproject
+#           to equal-area CRS so background sampling and thinning are unbiased.
 # Step 3 — Spatially thin occurrences to reduce autocorrelation.
 # Step 4 — Fit an initial MaxEnt model for variable importance, then select
 #           non-collinear predictors via VIF iteration.
@@ -26,12 +27,13 @@
 # KEY USER-TUNABLE SETTINGS (search for TUNE: throughout this file)
 # -----------------------------------------------------------------
 #   genus / species      — Change to run a different species.
+#   proj4_aea            — Equal-area CRS for model fitting and projection.
 #   minBuff              — Minimum accessible-area buffer in metres (Step 1).
-#   agg_factor thresholds — How aggressively rasters are coarsened by area (Step 2).
-#   thin_occurrences     — Spatial thinning intensity (Step 3).
+#   aggregation factor   — How aggressively rasters are coarsened (Step 2).
+#   thinning thresholds  — Thinning intensity by accessible-area size (Step 3).
 #   maxVIF               — Collinearity threshold for variable selection (Step 4).
-#   rm / fc              — Regularisation multipliers and feature classes to tune (Step 5).
-#   AUCmin               — Minimum acceptable AUC for best-model selection (Step 6).
+#   rm / fc              — Regularisation multipliers and feature classes (Step 5).
+#   AUCmin               — Minimum acceptable AUC for model selection (Step 6).
 #   calc_mess            — Whether to compute the MESS surface (Step 7; slow).
 #   numCores             — Parallel cores for ENMevaluate (Step 5).
 # =============================================================================
@@ -53,17 +55,34 @@ source("scripts/05_select_modelVariables.R")
 source("scripts/08_save_SDMoutputs_TSS.R")
 source("scripts/09_project_broader_region.R")
 
+# ── Equal-area projection CRS ─────────────────────────────────────────────────
+# Custom Albers Equal Area centred on the AU+SEA study region.
+#   lat_1 =  7°N  }  standard parallels — areas between these are most accurate;
+#   lat_2 = 36°S  }  chosen to bracket the full AU+SEA latitudinal range
+#   lat_0 = 15°S     latitude of the projection origin (centre of region)
+#   lon_0 = 132°E    central meridian bisecting the region longitudinally
+#
+# Using equal area ensures that:
+#   • background cells each represent the same land area (unbiased sampling),
+#   • spatial thinning removes one record per equal-area cell (not degree cell),
+#   • output maps do not exaggerate high-latitude areas.
+#
+# TUNE: to switch to Australian Albers (EPSG:3577, published standard):
+#   proj4_aea <- "+proj=aea +lat_1=-18 +lat_2=-36 +lat_0=0 +lon_0=132
+#                 +x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs"
+proj4_aea <- paste("+proj=aea +lat_1=7 +lat_2=-36 +lat_0=-15 +lon_0=132",
+                   "+x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs")
+
 # ── Species identity ──────────────────────────────────────────────────────────
 # TUNE: change these two lines to model a different species.
-# The data file (below) must contain matching GEN_DB / SP_DB entries.
-genus   <- "Archibasis"
-species <- "crucigera"
+genus    <- "Archibasis"
+species  <- "crucigera"
 binomial <- paste(genus, species)
 bw       <- paste(genus, species, sep = "_")   # filename-safe version
 
 # ── Output directories ────────────────────────────────────────────────────────
-fp  <- "SDM_outputs/"     # rasters, CSVs, and RData objects
-fp2 <- "SDM_maps/"        # PNG figures
+fp  <- "SDM_outputs/"
+fp2 <- "SDM_maps/"
 dir.create(file.path(fp, bw), showWarnings = FALSE, recursive = TRUE)
 dir.create(fp2,              showWarnings = FALSE, recursive = TRUE)
 
@@ -73,12 +92,22 @@ proj_extent <- define_projectionExtent()
 
 # ── Helper: spatial thinning ──────────────────────────────────────────────────
 # Returns a thinned data frame with at most one occurrence per raster cell.
-# agg_factor controls the cell size used for thinning: larger values = coarser
-# grid = more aggressive thinning. This reduces spatial autocorrelation among
-# training points, which can inflate cross-validation AUC.
+# agg_factor controls the cell size used for thinning: larger = more aggressive.
+# If ref_layer is in a projected (non-longlat) CRS, occurrence LONG/LAT
+# coordinates are automatically transformed before cell assignment.
 thin_occurrences <- function(occ_df, ref_layer, agg_factor) {
-  ref_agg  <- terra::aggregate(ref_layer, agg_factor)
-  cell_ids <- terra::cellFromXY(ref_agg, as.matrix(occ_df[, c("LONG", "LAT")]))
+  ref_agg <- terra::aggregate(ref_layer, agg_factor)
+  coords  <- as.matrix(occ_df[, c("LONG", "LAT")])
+
+  # Project coordinates to match the raster CRS when it is not longlat.
+  # terra::is.lonlat() returns FALSE for any projected (metre-based) CRS.
+  if (!terra::is.lonlat(ref_layer)) {
+    coords <- terra::project(coords,
+                              from = "EPSG:4326",
+                              to   = terra::crs(ref_layer, proj = TRUE))
+  }
+
+  cell_ids <- terra::cellFromXY(ref_agg, coords)
   occ_df |>
     dplyr::mutate(cell_id = cell_ids) |>
     dplyr::group_by(cell_id) |>
@@ -90,8 +119,6 @@ thin_occurrences <- function(occ_df, ref_layer, agg_factor) {
 # =============================================================================
 # Step 0: Load and filter occurrence records
 # =============================================================================
-# The CSV contains records for all species in the study; filter to the target.
-# LONG and LAT are required — rows with missing coordinates are dropped.
 
 occs <- data.table::fread("data/Combined_data_AUS-PHI-IND.csv")
 
@@ -104,12 +131,7 @@ message(sprintf("Records for %s: %d", binomial, nrow(cleanedOccs)))
 # =============================================================================
 # Step 1: Define the accessible area (M region)
 # =============================================================================
-# See 03_define_accessibleArea.R for full documentation.
-#
-# TUNE: minBuff — minimum buffer in metres around the alpha hull.
-#   Increase (e.g. 150000) for a wider M region that samples more
-#   background climate; decrease for range-restricted species where
-#   a tight M is more defensible ecologically.
+# TUNE: minBuff — minimum buffer radius in metres around the alpha hull.
 
 aa_shp <- define_accessibleArea(species_df    = cleanedOccs,
                                  minBuff       = 75000,
@@ -117,32 +139,27 @@ aa_shp <- define_accessibleArea(species_df    = cleanedOccs,
                                  saveShapefile = FALSE)
 
 # =============================================================================
-# Step 2: Clip and coarsen environmental layers
+# Step 2: Clip, coarsen, and reproject environmental layers
 # =============================================================================
-# Rasters are clipped to M (Step 1) and then aggregated to reduce computation
-# time. terra::aggregate(, fact = 5) increases cell size by a factor of 5
-# (e.g. 1 km → 5 km; 2.5 arcmin → ~12.5 arcmin).
+# Rasters are clipped to M in their native CRS, coarsened by aggregation,
+# then reprojected to the equal-area CRS defined above.
+#
+# Reprojection happens AFTER aggregation so that terra::project() operates on
+# fewer cells (faster) and the aggregation smoothing precedes reprojection.
+# method = "bilinear" is appropriate for continuous climate variables; use
+# method = "near" for categorical layers.
 #
 # TUNE: the aggregation factor (currently 5).
-#   Reduce to 2–3 if you have many records and need finer resolution.
-#   Increase to 10+ for very large accessible areas or slow machines.
 
 mod_vars <- clip_variableLayers(layerDir       = "ClimateOnly/",
                                  accessibleArea = aa_shp)
 mod_vars <- terra::aggregate(mod_vars, 5)
+mod_vars <- terra::project(mod_vars, proj4_aea, method = "bilinear")
 
 # =============================================================================
 # Step 3: Spatial thinning (adaptive to accessible-area size)
 # =============================================================================
-# Occurrences clustered in small areas give MaxEnt an inflated signal for
-# that habitat type. Thinning to one record per grid cell reduces this bias.
-# The thinning intensity scales with the accessible area (in km²) to keep
-# the model tractable and avoid over-thinning small ranges.
-#
-# TUNE: the area thresholds (e.g. 100000, 250000, …) and the agg_factor
-#   values (5, 10, 20, 40) to match the resolution of your study extent.
-#   For a species with very few records (< 30), consider skipping thinning
-#   (use cleanedOccs directly) to avoid losing too many points.
+# TUNE: area thresholds (km²) and agg_factor values.
 
 area_sqkm <- as.numeric(sf::st_area(aa_shp)) / 1e6
 
@@ -160,19 +177,19 @@ spp_df <- if (area_sqkm < 100000) {
 
 message(sprintf("Records after thinning: %d", nrow(spp_df)))
 
-occ_matrix <- as.matrix(spp_df[, c("LONG", "LAT")])
+# Project occurrence coordinates from WGS84 to the equal-area CRS.
+# All terra::extract() calls on projected rasters require coordinates in the
+# same CRS as the raster — these are passed to dismo, ENMevaluate, and maxnet.
+occ_matrix <- terra::project(
+  as.matrix(spp_df[, c("LONG", "LAT")]),
+  from = "EPSG:4326",
+  to   = proj4_aea
+)
 
 # =============================================================================
 # Step 4: Variable selection (VIF < 5)
 # =============================================================================
-# First an initial MaxEnt model is fitted on all variables to extract
-# permutation importances. These importances are used as a tiebreaker in the
-# VIF loop: when two variables are similarly collinear, the less-important one
-# is removed. See 05_select_modelVariables.R for full documentation.
-#
 # TUNE: maxVIF in select_sdmVariables().
-#   5 is the standard threshold. Lower (e.g. 3) produces a leaner set;
-#   higher (e.g. 10) retains more variables but risks collinearity artefacts.
 
 max_model <- dismo::maxent(x        = raster::stack(mod_vars),
                             p        = occ_matrix,
@@ -188,17 +205,7 @@ message(sprintf("Variables retained after VIF selection: %s",
 # =============================================================================
 # Step 5: Model tuning via ENMevaluate (spatial block cross-validation)
 # =============================================================================
-# Tests all combinations of regularisation multiplier (rm) and feature class
-# (fc). Models are ranked by AICc. See 06_generate_ENMevals.R for full
-# documentation of what rm and fc control ecologically/statistically.
-#
-# TUNE: rm (regularisation multiplier values) and fc (feature class strings).
-#   Add finer rm steps (e.g. 1.5) for more resolution around the optimum.
-#   Remove "LQHP" and "LQHPT" for small datasets (< 50 records) to avoid
-#   overfitting from product and threshold features.
-#
-# TUNE: numCores — set to (number of physical CPU cores − 1) on your machine.
-#   On Windows, parallel = TRUE requires the doParallel package.
+# TUNE: rm, fc, numCores.
 
 eval1 <- ENMeval::ENMevaluate(
   occs       = occ_matrix,
@@ -214,18 +221,7 @@ eval1 <- ENMeval::ENMevaluate(
 # =============================================================================
 # Step 6: Save training-area SDM outputs and derive the TSS threshold
 # =============================================================================
-# Selects the best model, thresholds it via modified TSS, and saves:
-#   *_SDM.tif          — continuous cloglog raster (training extent)
-#   *_SDM_PA.tif       — binary presence/absence raster (training extent)
-#   *_bestModel.csv    — model selection summary
-#   *_variableImportance.csv
-#
-# Returns: tss_out$threshold (used in Step 7 to threshold the projection).
-# See 08_save_SDMoutputs_TSS.R for full documentation of AUCmin and TSS.
-#
-# TUNE: AUCmin — minimum acceptable AUC for the best AICc model.
-#   Default 0.7. Raise to 0.8 for stricter quality control; lower to 0.6
-#   for data-sparse species where cross-validated AUC is inherently noisy.
+# TUNE: AUCmin.
 
 tss_out <- save_SDM_results(ENMeval_output = eval1,
                              AUCmin         = 0.7,
@@ -236,24 +232,20 @@ tss_out <- save_SDM_results(ENMeval_output = eval1,
 save(eval1, file = file.path(fp, bw, paste0(bw, "_ENMeval.RData")))
 
 # =============================================================================
-# Step 7: Project to AU+SEA with clamping and optional MESS
+# Step 7: Clip, reproject, and project to AU+SEA
 # =============================================================================
-# Clips global climate rasters to the AU+SEA projection extent, refits the
-# best model with maxnet (no Java temp files needed), projects with clamping,
-# and optionally computes a MESS surface.
+# proj_vars is clipped in native CRS then reprojected to proj4_aea — the same
+# CRS as the training rasters — so the projection step uses a consistent grid.
 #
-# mapDir = NULL suppresses per-step PNG output; the four-panel figure (Step 8)
-# is the primary visual summary and is built from the returned rasters.
-#
-# TUNE: calc_mess — set to FALSE to skip MESS computation and save time on
-#   large projection extents. The MESS panel in the Step 8 figure will be
-#   omitted automatically if calc_mess = FALSE.
+# mapDir = NULL suppresses the per-step PNG; Step 8 builds the figure instead.
+# TUNE: calc_mess = FALSE to skip MESS and save computation time.
 
 proj_vars <- clip_projectionLayers(
   layerDir         = "ClimateOnly/",
   projectionExtent = proj_extent,
   varNames         = names(predictors)
 )
+proj_vars <- terra::project(proj_vars, proj4_aea, method = "bilinear")
 
 proj_out <- project_toRegion(
   ENMeval_output  = eval1,
@@ -263,43 +255,58 @@ proj_out <- project_toRegion(
   tss_threshold   = tss_out$threshold,
   resultDir       = file.path(fp, bw),
   spp             = binomial,
-  mapDir          = NULL,      # suppress per-step PNG; Step 8 builds the figure
+  mapDir          = NULL,
   calc_mess       = TRUE
 )
 
 # =============================================================================
 # Step 8: Four-panel summary figure
 # =============================================================================
-# Combines the key model outputs into one publication-ready figure:
+# All spatial objects are projected to proj4_aea for a consistent equal-area
+# display. Occurrence points and the world basemap are transformed here;
+# raster data frames already carry AEA coordinates from terra::rast().
 #
-#   Top-left  (A): Training-area suitability (cloglog), zoomed to M region.
-#                  Accessible-area boundary shown as an orange outline.
-#                  Occurrence points overlaid.
-#   Top-right (B): Projected suitability across AU+SEA (cloglog).
-#   Bot-left  (C): Projected binary presence/absence map (AU+SEA),
-#                  thresholded by the TSS value from Step 6.
-#   Bot-right (D): MESS surface (AU+SEA) — red cells are novel environments
-#                  where the model is extrapolating; interpret with caution.
-#                  Omitted (blank panel) if calc_mess = FALSE above.
+# Panel layout:
+#   A (top-left)  — Training-area suitability, zoomed to M region.
+#                   Orange outline = accessible area; circles = occurrences.
+#   B (top-right) — Projected suitability across AU+SEA.
+#   C (bot-left)  — Projected binary presence/absence (TSS threshold).
+#   D (bot-right) — MESS surface; blank if calc_mess = FALSE above.
 #
-# TUNE: ggsave width / height below to change figure dimensions.
+# TUNE: pad_m (padding around the training-area panel in metres);
+#       ggsave width / height for figure dimensions.
 
-r_train   <- terra::rast(file.path(fp, bw, paste0(bw, "_SDM.tif")))
-train_df  <- as.data.frame(r_train, xy = TRUE) |> na.omit() |>
-               dplyr::rename(ClogLog = 3)
+r_train  <- terra::rast(file.path(fp, bw, paste0(bw, "_SDM.tif")))
+train_df <- as.data.frame(r_train, xy = TRUE) |> na.omit() |>
+              dplyr::rename(ClogLog = 3)
 
-xlim_aa   <- c(min(cleanedOccs$LONG) - 5, max(cleanedOccs$LONG) + 5)
-ylim_aa   <- c(min(cleanedOccs$LAT)  - 5, max(cleanedOccs$LAT)  + 5)
+# Project world basemap and accessible-area polygon to equal-area CRS.
+world_aea  <- sf::st_transform(world, crs = proj4_aea)
+aa_shp_aea <- sf::st_transform(aa_shp, crs = proj4_aea)
 
-# Panel A: training cloglog + accessible area outline + occurrences
+# Project occurrence points for the training-area panel.
+occ_aea_mat <- terra::project(
+  as.matrix(cleanedOccs[, c("LONG", "LAT")]),
+  from = "EPSG:4326",
+  to   = proj4_aea
+)
+occ_aea_df <- data.frame(X = occ_aea_mat[, 1], Y = occ_aea_mat[, 2])
+
+# Bounding box of the accessible area in AEA metres; add padding on each side.
+aa_bbox <- sf::st_bbox(aa_shp_aea)
+pad_m   <- 500000   # 500 km padding — reduce for tightly distributed species
+xlim_aa <- c(aa_bbox["xmin"] - pad_m, aa_bbox["xmax"] + pad_m)
+ylim_aa <- c(aa_bbox["ymin"] - pad_m, aa_bbox["ymax"] + pad_m)
+
+# Panel A: training cloglog + accessible-area outline + occurrences
 p_tl <- ggplot() +
-  geom_sf(data = world, fill = "grey90", colour = "grey60", linewidth = 0.2) +
+  geom_sf(data = world_aea, fill = "grey90", colour = "grey60", linewidth = 0.2) +
   geom_tile(data = train_df, aes(x = x, y = y, fill = ClogLog)) +
   scale_fill_viridis_c(name = "Suitability") +
-  geom_sf(data = aa_shp, fill = NA, colour = "orange", linewidth = 0.6) +
-  geom_point(data = cleanedOccs, aes(x = LONG, y = LAT),
+  geom_sf(data = aa_shp_aea, fill = NA, colour = "orange", linewidth = 0.6) +
+  geom_point(data = occ_aea_df, aes(x = X, y = Y),
              shape = 1, size = 0.75, colour = "black") +
-  coord_sf(xlim = xlim_aa, ylim = ylim_aa) +
+  coord_sf(crs = proj4_aea, xlim = xlim_aa, ylim = ylim_aa) +
   ggtitle(paste(binomial, "— training area")) +
   theme_classic()
 
@@ -307,38 +314,41 @@ p_tl <- ggplot() +
 proj_df <- as.data.frame(proj_out$projection, xy = TRUE) |> na.omit()
 
 p_tr <- ggplot() +
-  geom_sf(data = world, fill = "grey90", colour = "grey60", linewidth = 0.2) +
+  geom_sf(data = world_aea, fill = "grey90", colour = "grey60", linewidth = 0.2) +
   geom_tile(data = proj_df, aes(x = x, y = y, fill = cloglog)) +
   scale_fill_viridis_c(name = "Suitability") +
-  coord_sf(xlim = range(proj_df$x), ylim = range(proj_df$y)) +
+  coord_sf(crs = proj4_aea,
+           xlim = range(proj_df$x), ylim = range(proj_df$y)) +
   ggtitle("Projected suitability (AU+SEA)") +
   theme_classic()
 
-# Panel C: projected binary presence/absence (full AU+SEA extent)
+# Panel C: projected binary presence/absence
 pa_df <- as.data.frame(proj_out$proj_pa, xy = TRUE) |> na.omit() |>
            dplyr::mutate(presence = as.character(presence))
 
 p_bl <- ggplot() +
-  geom_sf(data = world, fill = "grey90", colour = "grey60", linewidth = 0.2) +
+  geom_sf(data = world_aea, fill = "grey90", colour = "grey60", linewidth = 0.2) +
   geom_tile(data = pa_df, aes(x = x, y = y, fill = presence)) +
   scale_fill_viridis_d(name = "Presence") +
-  coord_sf(xlim = range(pa_df$x), ylim = range(pa_df$y)) +
+  coord_sf(crs = proj4_aea,
+           xlim = range(pa_df$x), ylim = range(pa_df$y)) +
   ggtitle("Projected presence/absence (AU+SEA)") +
   theme_classic()
 
-# Panel D: MESS surface — NULL panel (blank) if calc_mess = FALSE
+# Panel D: MESS surface — NULL panel if calc_mess = FALSE
 if (!is.null(proj_out$mess)) {
   mess_df <- as.data.frame(proj_out$mess, xy = TRUE) |> na.omit()
   p_br <- ggplot() +
-    geom_sf(data = world, fill = "grey90", colour = "grey60", linewidth = 0.2) +
+    geom_sf(data = world_aea, fill = "grey90", colour = "grey60", linewidth = 0.2) +
     geom_tile(data = mess_df, aes(x = x, y = y, fill = MESS)) +
     scale_fill_gradient2(name = "MESS", low = "red", mid = "white",
                          high = "blue", midpoint = 0) +
-    coord_sf(xlim = range(mess_df$x), ylim = range(mess_df$y)) +
+    coord_sf(crs = proj4_aea,
+             xlim = range(mess_df$x), ylim = range(mess_df$y)) +
     ggtitle("MESS (red = novel environment)") +
     theme_classic()
 } else {
-  p_br <- NULL   # blank bottom-right cell when MESS was skipped
+  p_br <- NULL
 }
 
 panel_fig <- cowplot::plot_grid(p_tl, p_tr, p_bl, p_br,
@@ -353,7 +363,8 @@ ggsave(plot     = panel_fig,
 # Step 9: Cleanup temporary files
 # =============================================================================
 
-rm(p_tl, p_tr, p_bl, p_br, panel_fig, proj_df, pa_df, train_df)
+rm(p_tl, p_tr, p_bl, p_br, panel_fig, proj_df, pa_df, train_df,
+   occ_aea_df, occ_aea_mat, world_aea, aa_shp_aea)
 gc()
 files <- list.files(tempdir(), full.names = TRUE, all.files = TRUE, recursive = TRUE)
 file.remove(files)

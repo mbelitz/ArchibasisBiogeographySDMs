@@ -196,8 +196,20 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
   # the projection extent — the model must "learn" from within M only.
   # TUNE: increase bg sample size (currently 10000) for more stable fits on
   #       large accessible areas; the cost is proportionally longer fitting.
-  occ_coords <- as.matrix(occ_df[, c("LONG", "LAT")])
-  occ_env    <- terra::extract(training_vars, occ_coords) |> na.omit()
+
+  # Occurrence coordinates are stored as WGS84 LONG/LAT throughout the pipeline.
+  # When training_vars has been reprojected to an equal-area CRS (as in the
+  # standard pipeline), coordinates must be transformed before terra::extract().
+  occ_coords_wgs84 <- as.matrix(occ_df[, c("LONG", "LAT")])
+  occ_coords <- if (!terra::is.lonlat(training_vars)) {
+    terra::project(occ_coords_wgs84,
+                   from = "EPSG:4326",
+                   to   = terra::crs(training_vars, proj = TRUE))
+  } else {
+    occ_coords_wgs84
+  }
+
+  occ_env <- terra::extract(training_vars, occ_coords) |> na.omit()
 
   bg_env <- terra::spatSample(training_vars, size = 10000,
                                method = "random", na.rm = TRUE,
@@ -287,16 +299,28 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
   # MESS panels. In sdm_pipeline.R the four-panel composite figure is built
   # separately; pass mapDir = NULL there to avoid duplicate PNG output.
   if (!is.null(mapDir)) {
-    world   <- ne_countries(scale = "medium", returnclass = "sf")
+    world <- ne_countries(scale = "medium", returnclass = "sf")
+    # Transform world basemap to the raster's CRS when it is projected.
+    if (!terra::is.lonlat(proj_raster)) {
+      world <- sf::st_transform(world, crs = terra::crs(proj_raster))
+    }
     proj_df <- as.data.frame(proj_raster, xy = TRUE) |> na.omit()
     pa_df   <- as.data.frame(proj_pa,    xy = TRUE) |> na.omit() |>
                  dplyr::mutate(presence = as.character(presence))
+
+    # Derive coord_sf CRS argument — pass the raster's CRS when projected so
+    # ggplot renders world (sf) and tile data in the same coordinate space.
+    map_crs <- if (!terra::is.lonlat(proj_raster)) {
+      terra::crs(proj_raster)
+    } else {
+      NULL   # NULL lets coord_sf default to the data's own CRS (longlat)
+    }
 
     p_cont <- ggplot() +
       geom_sf(data = world, fill = "grey90", colour = "grey60", linewidth = 0.2) +
       geom_tile(data = proj_df, aes(x = x, y = y, fill = cloglog)) +
       scale_fill_viridis_c(name = "Suitability") +
-      coord_sf(xlim = range(proj_df$x), ylim = range(proj_df$y)) +
+      coord_sf(crs = map_crs, xlim = range(proj_df$x), ylim = range(proj_df$y)) +
       ggtitle(paste(spp, "— projected suitability (clamped)")) +
       theme_classic()
 
@@ -304,7 +328,7 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
       geom_sf(data = world, fill = "grey90", colour = "grey60", linewidth = 0.2) +
       geom_tile(data = pa_df, aes(x = x, y = y, fill = presence)) +
       scale_fill_viridis_d(name = "Presence") +
-      coord_sf(xlim = range(pa_df$x), ylim = range(pa_df$y)) +
+      coord_sf(crs = map_crs, xlim = range(pa_df$x), ylim = range(pa_df$y)) +
       ggtitle(paste(spp, "— projected presence/absence")) +
       theme_classic()
 
@@ -315,7 +339,7 @@ project_toRegion <- function(ENMeval_output, training_vars, occ_df,
         geom_tile(data = mess_df, aes(x = x, y = y, fill = MESS)) +
         scale_fill_gradient2(name = "MESS", low = "red", mid = "white",
                              high = "blue", midpoint = 0) +
-        coord_sf(xlim = range(mess_df$x), ylim = range(mess_df$y)) +
+        coord_sf(crs = map_crs, xlim = range(mess_df$x), ylim = range(mess_df$y)) +
         ggtitle(paste(spp, "— MESS (red = novel environment)")) +
         theme_classic()
       combined <- egg::ggarrange(p_cont, p_pa, p_mess, nrow = 2, draw = FALSE)
